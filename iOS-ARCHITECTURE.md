@@ -735,7 +735,7 @@ extension DateFormatter {
 ```swift
 // Package.swift dependencies
 .package(url: "https://github.com/datatheorem/TrustKit", from: "3.0.0"),
-.package(url: "https://github.com/mhayes853/swift-uuidv7", from: "1.0.0"),
+.package(url: "https://github.com/mhayes853/swift-uuidv7", from: "0.6.1"),
 .package(url: "https://github.com/launchdarkly/swift-eventsource", from: "3.0.0"),
 .package(url: "https://github.com/kean/Nuke", from: "12.0.0"),
 .package(url: "https://github.com/securing/IOSSecuritySuite", from: "1.9.0"),
