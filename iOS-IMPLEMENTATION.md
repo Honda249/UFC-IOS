@@ -1,8 +1,6 @@
 # iOS-IMPLEMENTATION.md — SAR Wallet iOS Foundation Layer
 
-> **Companion docs:** [iOS-APP.md](iOS-APP.md) (non-negotiable rules) · [iOS-ARCHITECTURE.md](iOS-ARCHITECTURE.md) (layers, APIs, ADRs)
->
-> Non-UI build plan. Every phase has exit criteria.
+> Canonical path: `iOS-IMPLEMENTATION.md`. Non-UI build plan. Every phase has exit criteria.
 > A phase is done when exit criteria pass — not when code is merged.
 > UI screens are planned separately after design is finalised.
 
@@ -67,39 +65,42 @@ DEBUG_INFORMATION_FORMAT = dwarf-with-dsym
 #### SPM Dependencies to Add
 ```
 TrustKit                 (datatheorem/TrustKit)             security — cert pinning
-swift-uuidv7             (mhayes853/swift-uuidv7)           idempotency keys
+swift-uuidv7             (mhayes853/swift-uuidv7, from 0.6.0) idempotency keys
 swift-eventsource        (launchdarkly/swift-eventsource)   SSE live balance
-Nuke                     (kean/Nuke)                        image caching (UI phase; resolve in Phase 0)
+Nuke                     (kean/Nuke)                        image caching
 IOSSecuritySuite         (securing/IOSSecuritySuite)        jailbreak detection
 ```
 
-**Nuke:** Added in Phase 0 so SPM resolves; first usage is when UI screens ship (deferred).
-Foundation-only phases do not import Nuke.
+#### `AppEnvironment` scaffold (minimal Phase 0; full container in [iOS-ARCHITECTURE.md](iOS-ARCHITECTURE.md) §11)
 
-#### `AppEnvironment` scaffold
+| Property | Introduced |
+|----------|------------|
+| `apiClient` | Phase 1 |
+| `authManager`, `keychainStore`, `sessionService` | Phase 2 |
+| `idempotencyStore`, `paymentService` (idempotency wiring) | Phase 3 |
+| `appAttestService` | Phase 4 |
+| `sseClient`, `identityService` | Phase 5 |
+| `walletService` | Phase 1 stub → Phase 5 logic |
+
+`AppState`, `AppRouter`, and `AuthRouter` are **not** on `AppEnvironment` — root `@State` + `.environment()` per §8.1.
+
 ```swift
-// placeholder fakes — replaced in later phases
+// Phase 0: placeholder fakes — properties added as phases land
 struct AppEnvironment {
     let apiClient: APIClient
     let authManager: AuthManager
     let keychainStore: KeychainStore
-    let idempotencyStore: IdempotencyStore
-    let appAttestService: AppAttestService
-    let sseClient: SSEClient
     let walletService: WalletService
     let paymentService: PaymentService
-    let identityService: IdentityService
-    let sessionService: SessionService
-    let appState: AppState
-    let appRouter: AppRouter
-    let authRouter: AuthRouter
 
-    static func production() -> AppEnvironment { fatalError("Not wired until Phase 6") }
+    static func production() -> AppEnvironment { fatalError("wired incrementally Phase 1–5") }
     static func preview() -> AppEnvironment {
         // Returns fake implementations for SwiftUI previews and unit tests
     }
 }
 ```
+
+**UI deferred:** [Nuke](https://github.com/kean/Nuke) (`LazyImage`) ships with the first screen that loads remote images — not in foundation phases.
 
 #### Exit Criteria — Phase 0
 - [ ] `xcodebuild -scheme WalletApp -destination 'generic/platform=iOS'` succeeds with 0 warnings
@@ -130,8 +131,8 @@ struct AppEnvironment {
 #### `Infrastructure/Network/Endpoint.swift`
 - `protocol Endpoint` with default implementations for `body`, `queryItems`,
   `requiresAuth`, `requiresAttestation`.
-- `idempotencyKey` default: `nil` — mutating endpoints must set explicitly; payment flows use
-  persisted keys from `IdempotencyStore` in **Phase 3**.
+- `idempotencyKey` default: `nil` — mutating endpoints MUST override with a persisted UUIDv7
+  key (PaymentEndpoints in Phase 3; never rely on the protocol default for payments).
 
 #### `App/AppDelegate.swift`
 ```swift
@@ -158,8 +159,8 @@ NetworkTests/
     test_send_GET_decodes_response()
     test_send_401_without_retry_throws_http()
     test_send_pinning_failure_throws_pinningFailed()
-    test_endpoint_GET_has_nil_idempotencyKey()
-    test_endpoint_default_mutating_has_nil_idempotencyKey()
+    test_endpoint_default_idempotencyKey_is_nil()
+    test_transfer_endpoint_requires_explicit_persisted_idempotencyKey()
     test_api_error_http_preserves_status_code()
     test_concurrent_send_operations_do_not_deadlock()
 ```
@@ -180,7 +181,8 @@ Use `URLProtocol` subclass as the fake transport — no real network in unit tes
 - `KeychainStore` operational with Secure Enclave-backed refresh token.
 - `AuthManager` actor with concurrent-401-safe refresh serialisation.
 - Biometric-gated session start.
-- Login and logout flows wired end-to-end against the Zitadel backend.
+- Login and logout flows wired end-to-end against the Zitadel backend (OIDC/device flow
+  details live in backend auth docs — implemented in `SessionService` / `IdentityService`).
 
 ### Deliverables
 
@@ -216,33 +218,17 @@ struct Token: Sendable, Codable {
 }
 ```
 
-#### `Infrastructure/Auth/TokenService.swift`
-```swift
-struct TokenService: Sendable {
-    let refreshURL: URL
-    let clientID: String
-
-    /// POST refresh_token grant to Zitadel. Uses ephemeral URLSession (no TrustKit on this host if separate).
-    func refresh(using refreshToken: String) async throws -> Token
-}
-```
-
 #### `Infrastructure/Auth/AuthManager.swift`
-Full actor implementation per [iOS-ARCHITECTURE.md §5](iOS-ARCHITECTURE.md). Key behaviours:
+Full actor implementation per [iOS-ARCHITECTURE.md](iOS-ARCHITECTURE.md) §5. Key behaviours:
 - `validToken()` — returns cached token if fresh; calls `performRefresh()` otherwise.
-- `refreshSession()` — clears in-memory access token; forces `performRefresh()` (401 retry path).
-- `performRefresh()` — private; single in-flight `Task`, all concurrent callers await same task.
+- `performRefresh()` — single in-flight `Task`, all concurrent callers await same task.
 - On `refresh_token_revoked` body → `clearSession()` + publish `.sessionRevoked` signal.
 - `clearSession()` — clears Keychain, in-memory token, cancels `refreshTask`.
 
 #### `Application/SessionService.swift`
 ```swift
-struct SessionService: Sendable {
-    let apiClient: APIClient
-    let authManager: AuthManager
-    let keychainStore: KeychainStore
-
-    func login(otp: String, phone: String) async throws
+final class SessionService: Sendable {
+    func login(otp: String, phone: String) async throws -> Void
     func logout() async
     func startBiometricSession() async throws // unlocks refresh token via Face ID
 }
@@ -254,7 +240,6 @@ AuthTests/
   AuthManagerTests.swift
     test_validToken_returns_cached_when_fresh()
     test_validToken_refreshes_when_expired()
-    test_refreshSession_forces_refresh_when_token_still_valid_locally()
     test_concurrent_401_triggers_single_refresh()     // launch 10 Tasks simultaneously
     test_refresh_token_revoked_clears_session()
     test_logout_clears_all_keychain_items()
@@ -292,13 +277,13 @@ device on `SecAccessControl` operations.
 ### Deliverables
 
 #### `CoreData/WalletModel.xcdatamodeld`
-Single entity `PendingRequest` with attributes listed in ARCHITECTURE.md §6.2.
+Single entity `PendingRequest` with attributes listed in [iOS-ARCHITECTURE.md](iOS-ARCHITECTURE.md) §6.2.
 Index on `idempotencyKey` (unique) and `terminalResponseAt` (for scan query).
 
 #### `Infrastructure/Idempotency/IdempotencyStore.swift`
 ```swift
 actor IdempotencyStore {
-    func findOrCreate(intentID: String, endpoint: String, payload: Data) async -> PendingRequestDTO
+    func findOrCreate(intentID: String, endpoint: String, payloadData: Data) async -> PendingRequestDTO
     func markTerminal(_ id: NSManagedObjectID) async
     func incrementAttempt(_ id: NSManagedObjectID, error: String) async
     func fetchRetryable() async -> [PendingRequestDTO]
@@ -321,19 +306,6 @@ struct TransferEndpoint: Endpoint {
 }
 ```
 
-#### `Application/PaymentService.swift`
-```swift
-struct PaymentService: Sendable {
-    let apiClient: APIClient
-    let idempotencyStore: IdempotencyStore
-
-    func initiateTransfer(_ cmd: TransferCommand) async throws -> TransferResponse
-    func retry(_ pending: PendingRequestDTO) async throws -> TransferResponse
-}
-```
-Orchestrates `IdempotencyStore.findOrCreate` → `APIClient.send(TransferEndpoint)` per
-[iOS-ARCHITECTURE.md §6](iOS-ARCHITECTURE.md).
-
 #### `App/AppEnvironment+LaunchRetry.swift`
 Launch-time retry scan — called in `@main` `init` before first scene activation.
 
@@ -352,13 +324,7 @@ IdempotencyTests/
 PaymentEndpointTests.swift
     test_transfer_endpoint_carries_persisted_idempotency_key()
     test_idempotency_key_is_uuidv7()
-
-PaymentServiceTests.swift
-    test_initiateTransfer_persists_key_before_send()
-    test_retry_reuses_same_idempotency_key()
-
-TransferViewModelTests.swift   // moved to Phase 5 if VM not ready; stub isSubmitting tests here optional
-    test_double_tap_guard_prevents_second_submission()
+    test_double_tap_guard_prevents_second_submission()  // view model test
     test_isSubmitting_reset_on_error()
     test_isSubmitting_reset_on_success()
 ```
@@ -386,12 +352,8 @@ TransferViewModelTests.swift   // moved to Phase 5 if VM not ready; stub isSubmi
 #### `Infrastructure/Attestation/AppAttestService.swift`
 ```swift
 final class AppAttestService: @unchecked Sendable {
-    // @unchecked Sendable: DCAppAttestService calls are serialised on a private queue.
-    // Injected via AppEnvironment — no singleton.
-
-    private let keychainStore: KeychainStore
-
-    init(keychainStore: KeychainStore) { self.keychainStore = keychainStore }
+    // @unchecked Sendable: DCAppAttestService is thread-safe; wrapper methods are
+    // invoked from APIClient actor context only — document invariant if extended.
 
     func registerIfNeeded() async throws
     // → generateKey() if no keyID in Keychain
@@ -467,34 +429,10 @@ SecurityTests/
 ### Deliverables
 
 #### `Navigation/AppRouter.swift` + `AuthRouter.swift`
-Per [iOS-ARCHITECTURE.md §8](iOS-ARCHITECTURE.md) — `@Observable @MainActor final class`, typed `[Route]` path.
-
-#### `Application/WalletService.swift`
-```swift
-struct WalletService: Sendable {
-    let apiClient: APIClient
-
-    func fetchBalance() async throws -> Decimal
-    func fetchTransactions(cursor: String?, limit: Int) async throws -> TransactionPage
-    func refreshBalance() async throws -> Decimal      // SSE / push callback path
-    func appendTransaction(_ tx: Transaction) async    // SSE event path
-}
-```
-
-#### `Application/IdentityService.swift`
-```swift
-struct IdentityService: Sendable {
-    let apiClient: APIClient
-
-    func requestOTP(phone: String) async throws
-    func verifyOTP(phone: String, code: String) async throws
-    func startKYC() async throws -> KYCSession
-    func registerDevice() async throws
-}
-```
+Per [iOS-ARCHITECTURE.md](iOS-ARCHITECTURE.md) §8 — `@Observable @MainActor final class`, typed `[Route]` path.
 
 #### `Infrastructure/RealTime/SSEClient.swift`
-LDSwiftEventSource wrapper per ARCHITECTURE.md §9.2.
+LDSwiftEventSource wrapper per [iOS-ARCHITECTURE.md](iOS-ARCHITECTURE.md) §9.2.
 - Start/stop driven by `scenePhase` via `.onChange(of: scenePhase)` in root scene.
 - Persists `lastEventID` in UserDefaults (non-sensitive — it is just a string cursor).
 - Reconnection backoff: 1 s → 2 s → 4 s … 30 s cap, ± 15% jitter.
@@ -557,7 +495,8 @@ SSETests/
   pending request retried with same idempotency key
 - [ ] SSE connects on foreground, disconnects on background (verified in proxy log)
 - [ ] APNs silent push triggers a balance refresh (verified with `xcrun simctl push`)
-- [ ] All view model tests pass; `SWIFT_STRICT_CONCURRENCY = complete` produces zero data-race warnings
+- [ ] All view model unit tests pass; `SWIFT_STRICT_CONCURRENCY = complete` on every build
+  (compile-time data-race checks; add XCTest concurrency stress tests where flakiness is a risk)
 
 ---
 
@@ -628,9 +567,9 @@ PerformanceTests/
 | 0 | DI scaffolding | — | No | compiles |
 | 1 | Network, TrustKit | — | No (URLProtocol) | 80% |
 | 2 | Auth, Keychain | — | **Yes (Keychain biometry)** | 80% |
-| 3 | Idempotency, PaymentService, Core Data | — | No | 80% |
+| 3 | Idempotency, Core Data | — | No | 80% |
 | 4 | App Attest, Security | — | **Yes (SE)** | 80% |
-| 5 | WalletService, IdentityService, State, ViewModels, SSE | — | No | 80% |
+| 5 | State, ViewModels, SSE | — | No | 80% |
 | 6 | — | Full E2E | **Yes** | — |
 
 ---
@@ -641,6 +580,7 @@ PerformanceTests/
 - [ ] `SWIFT_STRICT_CONCURRENCY = complete` produces 0 errors
 - [ ] All unit tests pass on both simulator and physical device
 - [ ] No `UUID()` used for idempotency keys (grep: `UUID()` in `Endpoints/` → 0 results)
+- [ ] Payment/transfer endpoints override `idempotencyKey` with persisted keys (grep: no payment `Endpoint` relying on default `nil`)
 - [ ] No `UserDefaults` for tokens or sensitive data (grep: `UserDefaults.*token` → 0 results)
 - [ ] No `ObservableObject` or `@Published` in new files (grep → 0 results)
 - [ ] No `LazyVStack` in list contexts > 50 items (code review)
@@ -648,7 +588,7 @@ PerformanceTests/
 - [ ] No `NumberFormatter()` or `DateFormatter()` constructed inside `body` (code review)
 - [ ] No `.task { }` wrapping payment submission calls (code review)
 - [ ] Instruments trace attached for any PR touching a scrollable list
-- [ ] ARCHITECTURE.md ADR updated if a design decision was made
+- [ ] [iOS-ARCHITECTURE.md](iOS-ARCHITECTURE.md) ADR updated if a design decision was made
 
 ---
 

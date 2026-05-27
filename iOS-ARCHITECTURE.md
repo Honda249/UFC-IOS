@@ -1,8 +1,6 @@
 # iOS-ARCHITECTURE.md — SAR Wallet iOS App (Foundation Layer)
 
-> **Companion docs:** [iOS-APP.md](iOS-APP.md) (non-negotiable rules) · [iOS-IMPLEMENTATION.md](iOS-IMPLEMENTATION.md) (phased build plan)
->
-> Non-UI foundation: networking, auth, idempotency, state, navigation, security.
+> Canonical path: `iOS-ARCHITECTURE.md`. Non-UI foundation: networking, auth, idempotency, state, navigation, security.
 > UI components and screen-level architecture are tracked separately once design is finalised.
 
 ---
@@ -97,7 +95,6 @@ WalletApp/
 │   ├── Auth/
 │   │   ├── AuthManager.swift    ← actor AuthManager, refresh serialisation
 │   │   ├── KeychainStore.swift  ← ~60 lines, SecItemAdd/Copy/Delete
-│   │   ├── TokenService.swift   ← refresh HTTP to Zitadel (no auth header)
 │   │   └── Token.swift          ← Token struct, isExpired computed var
 │   ├── Idempotency/
 │   │   ├── IdempotencyStore.swift  ← Core Data CRUD for PendingRequest
@@ -168,9 +165,9 @@ actor APIClient {
             request.setValue(key, forHTTPHeaderField: "Idempotency-Key")
         }
 
-        // App Attest signature (sensitive endpoints)
+        // App Attest signature (sensitive endpoints) — sign canonical request body bytes
         if endpoint.requiresAttestation {
-            let bodyData = try encodeBody(endpoint.body)
+            let bodyData = try encodeBody(for: endpoint)
             let sig = try await appAttest.sign(bodyData)
             request.setValue(sig, forHTTPHeaderField: "X-Attest-Signature")
         }
@@ -188,7 +185,7 @@ actor APIClient {
                 await auth.clearSession()
                 throw APIError.sessionRevoked
             }
-            _ = try await auth.refreshSession()
+            _ = try await auth.validToken()   // forces refresh; concurrent 401s share one Task
             return try await send(endpoint, allowRetry: false)
         }
 
@@ -226,8 +223,8 @@ extension Endpoint {
     var requiresAuth: Bool { true }
     var requiresAttestation: Bool { false }
     var idempotencyKey: String? { nil }
-    // Mutating endpoints MUST set a persisted key (transfers) or an explicit key at call site.
-    // Never use inline UUID7() for payment flows — see §6.
+    // POST / PATCH / DELETE endpoints MUST override with a persisted UUIDv7 key — see §6.
+    // Do not generate UUID7() in this default; payment and transfer routes bind keys to intentID.
 }
 ```
 
@@ -269,26 +266,16 @@ KeychainStore.load(accessToken)
               └── refresh failure (revoked / network) → clearSession() → show login
 ```
 
-### 5.2 `AuthManager` public API
+### 5.2 Concurrent 401 Handling
 
-| Method | Caller | Behaviour |
-|--------|--------|-----------|
-| `validToken()` | `APIClient` (auth header) | Returns cached token if fresh; else `performRefresh()` |
-| `refreshSession()` | `APIClient` (401 retry) | Clears in-memory access token; always `performRefresh()` once |
-| `clearSession()` | Logout, `refresh_token_revoked` | Keychain purge, cancel in-flight refresh `Task` |
-
-`performRefresh()` is **private**. Refresh HTTP lives in `TokenService` (injected).
-
-### 5.3 Concurrent 401 Handling
-
-Concurrent 401s call `refreshSession()`, which uses the same `performRefresh()` path as
-`validToken()`. Because `AuthManager` is an `actor`, calls are serialised:
+All concurrent callers that receive 401 call `auth.validToken()` which internally calls
+`performRefresh()`. Because `AuthManager` is an `actor`, calls are serialised:
 - First caller creates `refreshTask` and begins the network refresh.
 - All subsequent callers await `refreshTask.value` — they do NOT start a second refresh.
 - When the first caller finishes, all waiters receive the same new token.
 - `refreshTask` is cleared in `defer` whether success or failure.
 
-### 5.4 Keychain Layout
+### 5.3 Keychain Layout
 
 | Key | Protection | Control |
 |-----|-----------|---------|
@@ -443,10 +430,14 @@ final class TransactionHistoryViewModel {
 
 ### 8.1 Router Per Flow
 
+Routers are **`@Observable @MainActor` classes owned as `@State` at the root scene** — they are
+**not** stored on `AppEnvironment` (navigation state is UI-owned; services stay in `AppEnvironment`).
+
 ```swift
-// Two routers, injected as @State at the root scene level
+// WalletApp root — routers live here only
 @State private var appRouter = AppRouter()
 @State private var authRouter = AuthRouter()
+@State private var appState = AppState()
 
 // Root scene switch
 var body: some View {
@@ -461,6 +452,7 @@ var body: some View {
     .environment(appState)
     .environment(appRouter)
     .environment(authRouter)
+    .environment(env)   // AppEnvironment — services only; see §11
 }
 ```
 
@@ -628,9 +620,7 @@ struct SecureDisplayView<Content: View>: UIViewRepresentable {
 ## 11. Dependency Injection
 
 Single `AppEnvironment` struct constructed at app launch and injected via SwiftUI `.environment`.
-No service locator, no singletons (except `URLSession.shared` for non-pinned dev tooling).
-`AppAttestService`, `APIClient`, and `AuthManager` are created once in `AppEnvironment.production()`
-and passed by value/reference into consumers.
+No service locator, no singletons (except `URLSession.shared` for non-pinned paths).
 
 ```swift
 struct AppEnvironment {
@@ -647,13 +637,6 @@ struct AppEnvironment {
     let paymentService: PaymentService
     let identityService: IdentityService
     let sessionService: SessionService
-
-    // Navigation
-    let appRouter: AppRouter
-    let authRouter: AuthRouter
-
-    // Shared state
-    let appState: AppState
 
     static func production() -> AppEnvironment { ... }
     static func preview() -> AppEnvironment { ... }     // fake implementations
@@ -674,7 +657,7 @@ Main thread (@MainActor)
 
 Cooperative thread pool (default actor)
   ├── APIClient.send() — URLSession async
-  ├── AuthManager.validToken() / refreshSession()
+  ├── AuthManager.validToken() / refresh
   ├── JSON decoding (inside APIClient)
   ├── Core Data reads/writes (IdempotencyStore)
   └── SSEClient event parsing
@@ -735,7 +718,7 @@ extension DateFormatter {
 ```swift
 // Package.swift dependencies
 .package(url: "https://github.com/datatheorem/TrustKit", from: "3.0.0"),
-.package(url: "https://github.com/mhayes853/swift-uuidv7", from: "0.6.1"),
+.package(url: "https://github.com/mhayes853/swift-uuidv7", from: "1.0.0"),
 .package(url: "https://github.com/launchdarkly/swift-eventsource", from: "3.0.0"),
 .package(url: "https://github.com/kean/Nuke", from: "12.0.0"),
 .package(url: "https://github.com/securing/IOSSecuritySuite", from: "1.9.0"),

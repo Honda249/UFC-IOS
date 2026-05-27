@@ -1,0 +1,37 @@
+name: iOS
+
+on:
+  push:
+    branches: [main, 'feature/**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (generic iOS)
+        run: |
+          xcodebuild -scheme WalletApp \
+            -destination 'generic/platform=iOS' \
+            -configuration Debug \
+            build
+
+      - name: Test (iOS Simulator)
+        run: |
+          xcodebuild -scheme WalletApp \
+            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -configuration Debug \
+            test \
+            || xcodebuild -scheme WalletApp \
+            -destination 'platform=iOS Simulator,name=iPhone 17' \
+            -configuration Debug \
+            test

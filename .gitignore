@@ -1,0 +1,22 @@
+# Xcode
+DerivedData/
+build/
+*.xcuserstate
+*.xcuserdatad
+xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# XcodeGen
+WalletApp.xcodeproj/
+WalletApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+
+# Swift PM
+.build/
+Package.resolved
+
+# macOS
+.DS_Store

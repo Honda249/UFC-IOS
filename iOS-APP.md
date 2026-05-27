@@ -1,8 +1,6 @@
 # iOS-APP.md — SAR Wallet iOS App
 
-> **Companion docs:** [iOS-ARCHITECTURE.md](iOS-ARCHITECTURE.md) (layers, APIs, ADRs) · [iOS-IMPLEMENTATION.md](iOS-IMPLEMENTATION.md) (phased build plan)
->
-> Authoritative rules for AI-assisted development on the iOS client.
+> Canonical path: `iOS-APP.md`. Authoritative rules for AI-assisted development on the iOS client.
 > Every suggestion, generated snippet, refactor, or review MUST comply with these rules.
 > No exceptions without an explicit `# OVERRIDE:` comment and team sign-off.
 
@@ -94,16 +92,10 @@ protocol Endpoint {
     var path: String { get }
     var method: HTTPMethod { get }
     var body: (any Encodable)? { get }
-    var queryItems: [URLQueryItem]? { get }
     var requiresAuth: Bool { get }
-    var requiresAttestation: Bool { get }
-    /// UUIDv7 string. Non-nil for mutating requests that carry Idempotency-Key.
-    /// Payment/transfer endpoints MUST use a key persisted via IdempotencyStore (Rule 7).
-    var idempotencyKey: String? { get }
+    var idempotencyKey: String? { get }  // non-nil for all mutating requests
 }
 ```
-
-Full default implementations: [iOS-ARCHITECTURE.md §4.2](iOS-ARCHITECTURE.md).
 
 ---
 
@@ -195,7 +187,6 @@ tokens — causing permanent logout. The actor with a cached `Task` prevents thi
 ```swift
 actor AuthManager {
     private let keychainStore: KeychainStore
-    private let tokenService: TokenService
     private var accessToken: Token?
     private var refreshTask: Task<Token, Error>?
 
@@ -205,19 +196,17 @@ actor AuthManager {
         return try await performRefresh().value
     }
 
-    /// Called by APIClient on 401 (after checking refresh_token_revoked). Forces one refresh.
-    func refreshSession() async throws -> String {
-        accessToken = nil
-        return try await performRefresh().value
-    }
-
     private func performRefresh() async throws -> Token {
         // Re-use in-flight refresh task — all concurrent callers await the same Task.
         if let existing = refreshTask { return try await existing.value }
         let task = Task<Token, Error> {
-            let newToken = try await tokenService.refresh(using: keychainStore.refreshToken())
+            // Refresh via URLSession directly (not APIClient.send) — avoids 401 retry loop.
+            let newToken = try await performTokenRefresh(
+                refreshToken: try keychainStore.loadRefreshToken()
+            )
             self.accessToken = newToken
-            try keychainStore.save(accessToken: newToken)
+            try keychainStore.saveAccessToken(newToken.value)
+            // Persist rotated refresh token when the backend returns one.
             return newToken
         }
         refreshTask = task
@@ -229,13 +218,10 @@ actor AuthManager {
         accessToken = nil
         refreshTask?.cancel()
         refreshTask = nil
-        keychainStore.clearAll()
+        try? keychainStore.clearAll()
     }
 }
 ```
-
-`TokenService` performs the refresh HTTP call to Zitadel (`POST /oauth/v2/token`). See
-[iOS-ARCHITECTURE.md §5](iOS-ARCHITECTURE.md) and Phase 2 in [iOS-IMPLEMENTATION.md](iOS-IMPLEMENTATION.md).
 
 **Additional auth rules:**
 - On `clearSession()` (logout or refresh failure): purge Keychain, in-memory cache, pending
@@ -269,13 +255,19 @@ RULE: Access tokens and refresh tokens are stored ONLY in Keychain.
   jailbreak detection to raise risk score (not block outright).
 
 ```swift
-// Minimal KeychainStore — hand-rolled, no third-party wrapper in this path
+// Minimal KeychainStore — instance struct, injected via AppEnvironment (no static API)
 struct KeychainStore {
-    static func save(_ data: Data, forKey key: String, access: SecAccessControl? = nil) throws
-    static func load(forKey key: String) throws -> Data
-    static func delete(forKey key: String)
+    func saveAccessToken(_ token: String) throws
+    func loadAccessToken() throws -> String
+    func deleteAccessToken()
+
+    func saveRefreshToken(_ token: String) throws   // SecAccessControl(.biometryCurrentSet)
+    func loadRefreshToken() throws -> String
+    func deleteRefreshToken()
+
+    func clearAll() throws
 }
-// Access control for refresh token:
+// Access control for refresh token (used inside saveRefreshToken):
 let access = SecAccessControlCreateWithFlags(
     nil,
     kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
@@ -298,16 +290,16 @@ RULE: Every mutating network request carries a UUIDv7 Idempotency-Key header.
   Foundation's `UUID()` (which generates v4, unordered).
 - The key is **bound to the user intent** (e.g., the draft transfer record), not the
   network call. One transfer attempt = one key, forever.
-- Storage schema (Core Data entity `PendingRequest`):
+- Storage schema (Core Data entity `PendingRequest` — canonical definition in [iOS-ARCHITECTURE.md](iOS-ARCHITECTURE.md) §6.2):
   ```
-  idempotencyKey: String       // UUIDv7 string
-  intentID: String             // client-side dedup key (e.g. transfer draft ID)
-  endpoint: String             // route identifier
-  payloadData: Data            // JSON-encoded request body
+  idempotencyKey: String     // UUIDv7 string (indexed, unique)
+  intentID: String           // client-side dedup key, e.g. "transfer-\(draftID)"
+  endpoint: String           // route identifier
+  payloadData: Data          // JSON-encoded request body
   createdAt: Date
   attempts: Int16
   lastError: String?
-  terminalResponseAt: Date?    // set when server returns 2xx or non-retryable 4xx
+  terminalResponseAt: Date?  // set when server returns 2xx or non-retryable 4xx
   ```
 - On app launch, scan for pending requests with `terminalResponseAt == nil` and retry them.
 - Purge rows with `terminalResponseAt` older than 25 hours (backend deduplication window is 24h).
